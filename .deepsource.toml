@@ -1,0 +1,10 @@
+version = 1
+
+[[analyzers]]
+name = "php"
+enabled = true
+
+  [analyzers.meta]
+  target_version = "7.4"  # or whatever PHP version your plugin uses
+  project_root = "."      # root folder of your plugin
+  run_laravel_ruleset = false
