@@ -4,3 +4,10 @@ version = 1
 name = "php"
 enabled = true
 
+  [analyzers.meta]
+  runtime_version = "8.1"  # or match your WordPress PHP version
+  auto_install_dependencies = false
+
+[[transformers]]
+name = "format"
+enabled = true
