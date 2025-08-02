@@ -322,7 +322,6 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
 
     class IGM_Mapping_List_Table extends WP_List_Table
     {
-        private $data;
 
         public function __construct()
         {
@@ -488,17 +487,16 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
         </form>
         <?php
     }
+    // Helper to mask token, showing only last 4 characters
+    function mask_token($token) {
+        $len = strlen($token);
+        return $len > 4 ? str_repeat('*', $len - 4) . substr($token, -4) : $token;
+    }
 
     function igm_render_teachable_circle_settings_form() {
         $circle_v1 = get_option('igm_circle_api_token_v1', '');
         $circle_v2 = get_option('igm_circle_api_token_v2', '');
         $teachable_api = get_option('igm_teachable_api_key', '');
-
-        // Helper to mask token, showing only last 4 characters
-        function mask_token($token) {
-            $len = strlen($token);
-            return $len > 4 ? str_repeat('*', $len - 4) . substr($token, -4) : $token;
-        }
 
         // Handle form submit
         if (isset($_POST['save_api_tokens']) && check_admin_referer('igm_save_settings', 'igm_settings_nonce')) {
@@ -706,7 +704,6 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
     }
     class IGM_Logs_List_Table extends WP_List_Table
     {
-        private $data;
         public function __construct()
         {
             parent::__construct([
