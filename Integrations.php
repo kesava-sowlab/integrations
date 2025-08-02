@@ -686,8 +686,6 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
         return $options;
     }
 
-
-
     /**
      * Mask API keys – keeps only last 4 characters.
      */
