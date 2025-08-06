@@ -496,7 +496,7 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
         }
     });
 
-
+    
     // === Admin UI: Settings Page ===
     add_action('admin_menu', function () {
         add_submenu_page(
