@@ -10,33 +10,34 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
     define('TEACHABLE_API_URL', 'https://developers.teachable.com/v1/courses');
 
     // === Table Helpers ===
-    function igm_get_circle_space_by_course_id($course_id)
+    function igm_get_circle_space_group_by_course_id($course_id)
     {
         global $wpdb;
         $table = $wpdb->prefix . 'teachable_circle_mapping';
         return $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE course_id = %d", $course_id), ARRAY_A);
     }
 
-    function igm_save_circle_space($course_id, $space_id, $course_name, $slug)
+    function igm_save_circle_space_group($course_id, $space_group_id, $course_name, $slug)
     {
         global $wpdb;
         $table  = $wpdb->prefix . 'teachable_circle_mapping';
         $exists = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $table WHERE course_id = %d", $course_id));
         if ($exists) {
             return $wpdb->update($table, [
-                'space_id'    => $space_id,
-                'course_name' => $course_name,
-                'slug'        => $slug,
+                'space_group_id' => $space_group_id,
+                'course_name'    => $course_name,
+                'slug'           => $slug,
             ], ['course_id' => $course_id]);
         } else {
             return $wpdb->insert($table, [
-                'course_id'   => $course_id,
-                'space_id'    => $space_id,
-                'course_name' => $course_name,
-                'slug'        => $slug,
+                'course_id'      => $course_id,
+                'space_group_id' => $space_group_id,
+                'course_name'    => $course_name,
+                'slug'           => $slug,
             ]);
         }
     }
+
     function igm_log_action($action, $message)
     {
         global $wpdb;
@@ -46,6 +47,7 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
             'message' => sanitize_textarea_field($message),
         ]);
     }
+
     // === Table Creation on Activation ===
     register_activation_hook(__FILE__, function () {
         global $wpdb;
@@ -58,10 +60,10 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
         course_id BIGINT UNSIGNED NOT NULL UNIQUE,
         course_name VARCHAR(255) NOT NULL,
         slug VARCHAR(255) NOT NULL,
-        space_id BIGINT UNSIGNED NOT NULL,
+        space_group_id BIGINT UNSIGNED NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    ) $charset_collate;";
+        ) $charset_collate;";
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
         dbDelta($sql);
 
@@ -74,22 +76,25 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
         ) $charset_collate;";
         dbDelta($log_sql);
 
-        // Dynamic cron setup
+        $update_interval = get_option('igm_update_cron_interval', 'daily');
         $delete_interval = get_option('igm_delete_cron_interval', 'daily');
+
+        if (! wp_next_scheduled('igm_cron_update_course_names')) {
+            wp_schedule_event(time(), $update_interval, 'igm_cron_update_course_names');
+        }
 
         if (! wp_next_scheduled('igm_cron_delete_removed_courses')) {
             wp_schedule_event(time(), $delete_interval, 'igm_cron_delete_removed_courses');
         }
     });
 
-    add_action('igm_cron_delete_removed_courses', 'igm_delete_spaces_for_removed_courses');
+    add_action('igm_cron_update_course_names', 'igm_check_and_update_course_names');
+    add_action('igm_cron_delete_removed_courses', 'igm_delete_space_groups_for_removed_courses');
 
-    // === Deactivation Cleanup ===
     register_deactivation_hook(__FILE__, function () {
         wp_clear_scheduled_hook('igm_daily_teachable_sync');
     });
 
-    // === Cron Interval & Hook ===
     add_filter('cron_schedules', function ($schedules) {
         $schedules['every_minute'] = [
             'interval' => 60,
@@ -99,12 +104,13 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
     });
 
     add_action('igm_daily_teachable_sync', function () {
-        igm_delete_spaces_for_removed_courses();
+        igm_check_and_update_course_names();
+        igm_delete_space_groups_for_removed_courses();
     });
+
     function handle_teachable_enrollment($request)
     {
         $body = $request->get_json_params();
-        error_log("new_teachable_enrollment");
 
         if (
             ! is_array($body) ||
@@ -121,75 +127,69 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
         $slug        = sanitize_title($course_name);
         $email       = sanitize_email($body['object']['user']['email']);
 
-        $stored_space_data = igm_get_circle_space_by_course_id($course_id);
-        $space_id          = $stored_space_data['space_id'] ?? null;
+        $stored_space_group_data = igm_get_circle_space_group_by_course_id($course_id);
+        $space_group_id          = $stored_space_group_data['space_group_id'] ?? null;
 
         $community_id    = get_option('igm_circle_community_id');
         $circle_token_v1 = get_option('igm_circle_api_token_v1');
         $circle_token_v2 = get_option('igm_circle_api_token_v2');
-        $space_group_id  = get_option('igm_circle_space_group_id');
 
         if (empty($community_id)) {
-            error_log("Circle Community ID Missing");
             return;
         }
         if (empty($circle_token_v1)) {
-            error_log("Circle v1 Token Missing");
             return;
         }
 
         if (empty($circle_token_v2)) {
-            error_log("Circle  v2Token Missing");
             return;
         }
         // Step 1: Create space if not exists
-        if (! $space_id) {
-            error_log("Circle API Error:  before request");
-            // v2
-            $circle_response = wp_remote_post('https://app.circle.so/api/admin/v2/spaces', [
+        if (! $space_group_id) {
+            $url = 'https://app.circle.so/api/v1/space_groups?community_id=' . $community_id;
+            $circle_response = wp_remote_post($url, [
                 'headers' => [
-                    'Authorization' => 'Token ' . $circle_token_v2,
+                    'Authorization' => 'Token ' . $circle_token_v1,
                     'Content-Type'  => 'application/json',
                 ],
                 'body'    => json_encode([
-                    'community_id'               => $community_id,
-                    'name'                       => $course_name,
-                    'slug'                       => $slug,
-                    'is_private'                 => true,
-                    'is_hidden_from_non_members' => true,
-                    'is_hidden'                  => false,
-                    'space_group_id'             => $space_group_id,
-                    'topics'                     => [1],
-                    'space_type'                 => 'course',
+                    'name'                                     => $course_name,
+                    'slug'                                     => $slug,
+                    'add_members_to_space_group_on_space_join' => false,
+                    'allow_members_to_create_spaces'           => false,
+                    'automatically_add_members_to_new_spaces'  => false,
+                    'hide_non_member_spaces_from_sidebar'      => true,
+                    'is_hidden_from_non_members'               => true,
+                    'space_order_array'                        => [],
+                    'position'                                 => 1,
                 ]),
             ]);
 
             if (is_wp_error($circle_response)) {
-                error_log("Circle API Error: " . $circle_response->get_error_message());
                 return new WP_REST_Response(['error' => 'Circle API request failed'], 500);
             }
 
             $response_body = json_decode(wp_remote_retrieve_body($circle_response), true);
-            $space_id = $response_body['space']['id'] ?? null;
+            $space_group_id = $response_body['space_group']['id'] ?? null;
 
-            if ($space_id) {
-                igm_log_action('space_created', "Created Circle space {$space_id} for course {$course_id} ({$course_name})");
-                igm_save_circle_space($course_id, $space_id, $course_name, $slug);
+            if ($space_group_id) {
+                igm_log_action('space_group_created', "Created Circle space group {$space_group_id} for course {$course_id} ({$course_name})");
+                igm_save_circle_space_group($course_id, $space_group_id, $course_name, $slug);
             } else {
-                return new WP_REST_Response(['error' => 'Space creation failed'], 500);
+                return new WP_REST_Response(['error' => 'Space group creation failed'], 500);
             }
         }
 
         // Step 2: Invite user to community and assign space group
         $query_params = http_build_query([
-            'email'        => $email,
-            'community_id' => $community_id,
-            'space_id'     => $space_id,
+            'email'          => $email,
+            'community_id'   => $community_id,
+            'space_group_id' => $space_group_id,
         ]);
-        $url = 'https://app.circle.so/api/v1/space_members' .
+        $url = 'https://app.circle.so/api/v1/space_group_members' .
             '?email=' . $email .
-            '&community_id=' . $community_id .
-            '&space_id=' . $space_id;
+            '&space_group_id=' . $space_group_id .
+            '&community_id=' . $community_id;
 
         $invite_response = wp_remote_post($url, [
             'headers' => [
@@ -200,20 +200,16 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
 
         $response_code = wp_remote_retrieve_response_code($invite_response);
         $response_body = wp_remote_retrieve_body($invite_response);
-        error_log("Circle Invite response ($response_code): " . $response_body);
-
-        error_log("Circle Invite response  url ($response_code): " . $url);
 
         if (is_wp_error($invite_response) || $response_code >= 400) {
             $error_message = is_wp_error($invite_response) ? $invite_response->get_error_message() : $response_body;
-            error_log("Circle Invite Error: " . $error_message);
             return new WP_REST_Response(['error' => 'Failed to invite user'], 500);
         }
-        igm_log_action('user_invited', "Invited {$email} to Circle space {$space_id}");
+        igm_log_action('user_invited', "Invited {$email} to Circle space group{$space_group_id}");
 
         return new WP_REST_Response([
-            'message'  => 'User invited successfully',
-            'space_id' => $space_id,
+            'message'        => 'User invited successfully',
+            'space_group_id' => $space_group_id,
         ], 200);
     }
 
@@ -228,9 +224,10 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
 
     // === Webhook Handler ===
 
-    // === Cron: Delete Circle Groups for Removed Courses ===
-    function igm_delete_spaces_for_removed_courses()
+    // === Cron: Sync Course Name Updates ===
+    function igm_check_and_update_course_names()
     {
+        $update_interval = get_option('igm_update_cron_interval', 'daily');
         global $wpdb;
         $table           = $wpdb->prefix . 'teachable_circle_mapping';
         $teachable_key   = get_option('igm_teachable_api_key');
@@ -249,11 +246,6 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
         $response = wp_remote_get(TEACHABLE_API_URL, [
             'headers' => ['apiKey' => $teachable_key],
         ]);
-
-        if (is_wp_error($response)) {
-            error_log("Teachable API Error (Delete Polling): " . $response->get_error_message());
-            return;
-        }
         $status_code = wp_remote_retrieve_response_code($response);
         if ($status_code === 401) {
             error_log('Teachable API Error 401: Unauthorized - Invalid API key.');
@@ -265,6 +257,86 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
             error_log("Teachable API Error {$status_code}: ");
             return;
         } elseif ($status_code === 200) {
+            error_log("Teachable Status {$status_code}: ");
+    // Log the response safely
+
+            if (is_wp_error($response)) {
+                error_log("Teachable API Error: " . $response->get_error_message());
+                return;
+            }
+
+            $data    = json_decode(wp_remote_retrieve_body($response), true);
+            $courses = $data['courses'] ?? [];
+
+            foreach ($courses as $course) {
+                $course_id    = sanitize_text_field($course['id']);
+                $current_name = sanitize_text_field($course['name']);
+                $current_slug = sanitize_title($current_name);
+
+                $stored = igm_get_circle_space_group_by_course_id($course_id);
+                if (! $stored || ! isset($stored['space_group_id'])) {
+                    continue;
+                }
+
+                if ($stored['course_name'] !== $current_name) {
+                    $update = wp_remote_request("https://app.circle.so/api/v1/space_groups/{$stored['space_group_id']}", [
+                        'method'  => 'PUT',
+                        'headers' => [
+                            'Authorization' => 'Token ' . $circle_token_v1,
+                            'Content-Type'  => 'application/json',
+                        ],
+                        'body'    => json_encode([
+                            'name' => $current_name,
+                            'slug' => $current_slug,
+                        ]),
+                    ]);
+
+                    $update_code = wp_remote_retrieve_response_code($update);
+                    if ($update_code === 200 || $update_code === 201) {
+                        igm_log_action('space_group_updated', "Updated Circle space group {$stored['space_group_id']} to '{$current_name}'");
+
+                        igm_save_circle_space_group($course_id, $stored['space_group_id'], $current_name, $current_slug);
+                        error_log("Circle space group updated: $course_id → $current_name");
+                    } else {
+                        error_log("Circle update failed with code $update_code for course $course_id");
+                    }
+                }
+            }
+        }
+    }
+
+    // === Cron: Delete Circle Groups for Removed Courses ===
+    function igm_delete_space_groups_for_removed_courses()
+    {
+        global $wpdb;
+        $table           = $wpdb->prefix . 'teachable_circle_mapping';
+        $teachable_key   = get_option('igm_teachable_api_key');
+        $circle_token_v1 = get_option('igm_circle_api_token_v1');
+        $community_id    = get_option('igm_circle_community_id');
+
+        if (empty($teachable_key)) {
+            return;
+        }
+
+        if (empty($circle_token_v1)) {
+            return;
+        }
+
+        $response = wp_remote_get(TEACHABLE_API_URL, [
+            'headers' => ['apiKey' => $teachable_key],
+        ]);
+
+        if (is_wp_error($response)) {
+            return;
+        }
+        $status_code = wp_remote_retrieve_response_code($response);
+        if ($status_code === 401) {
+            return;
+        } elseif ($status_code === 404) {
+            return;
+        } elseif ($status_code !== 200) {
+            return;
+        } elseif ($status_code === 200) {
             $data         = json_decode(wp_remote_retrieve_body($response), true);
             $existing_ids = array_map(fn($course) => (string) $course['id'], $data['courses'] ?? []);
 
@@ -272,8 +344,8 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
 
             foreach ($mappings as $row) {
                 if (! in_array((string) $row['course_id'], $existing_ids)) {
-                    $space_id        = $row['space_id'];
-                    $delete_response = wp_remote_request("https://app.circle.so/api/v1/spaces/{$space_id}", [
+                    $space_group_id  = $row['space_group_id'];
+                    $delete_response = wp_remote_request("https://app.circle.so/api/v1/space_groups/{$space_group_id}?community_id={$community_id}", [
                         'method'  => 'DELETE',
                         'headers' => [
                             'Authorization' => 'Token ' . $circle_token_v1,
@@ -283,11 +355,8 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
 
                     $code = wp_remote_retrieve_response_code($delete_response);
                     if ($code === 204 || $code === 200) {
-                        igm_log_action('space_deleted', "Deleted Circle space {$space_id} for removed course {$row['course_id']}");
+                        igm_log_action('space_group_deleted', "Deleted Circle space group{$space_group_id} for removed course {$row['course_id']}");
                         $wpdb->delete($table, ['course_id' => $row['course_id']]);
-                        error_log("Deleted Circle space $space_id for removed course {$row['course_id']}");
-                    } else {
-                        error_log("Failed to delete space $space_id: HTTP $code");
                     }
                 }
             }
@@ -335,20 +404,20 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
         public function get_columns()
         {
             return [
-                'course_id'   => 'Teachable Course ID',
-                'space_id'    => 'Circle Space ID',
-                'course_name' => 'Course Name',
-                'created_at'  => 'Created',
+                'course_id'      => 'Teachable Course ID',
+                'space_group_id' => 'Circle Space Group ID',
+                'course_name'    => 'Course Name',
+                'created_at'     => 'Created',
             ];
         }
 
         public function get_sortable_columns()
         {
             return [
-                'course_id'   => ['course_id', false],
-                'course_name' => ['course_name', false],
-                'space_id'    => ['space_id', false],
-                'created_at'  => ['created_at', true], // ✅ default sort
+                'course_id'      => ['course_id', false],
+                'course_name'    => ['course_name', false],
+                'space_group_id' => ['space_group_id', false],
+                'created_at'     => ['created_at', true],
             ];
         }
 
@@ -371,7 +440,7 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
             $order   = strtolower($_GET['order'] ?? 'desc');
 
             // Validate and sanitize
-            $allowed_orderby = ['course_id', 'course_name', 'space_id', 'created_at'];
+            $allowed_orderby = ['course_id', 'course_name', 'space_group_id', 'created_at'];
             if (! in_array($orderby, $allowed_orderby, true)) {
                 $orderby = 'created_at';
             }
@@ -440,44 +509,55 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
         );
     });
 
-    function igm_render_settings_page() {
+    function igm_render_settings_page()
+    {
         echo '<div class="wrap"><h1>Integration Settings</h1>';
         igm_render_schedule_settings_form();
         igm_render_teachable_circle_settings_form();
         igm_render_community_settings_form();
-        igm_render_space_group_settings_form();
         echo '</div>';
     }
 
-    function igm_render_schedule_settings_form() {
-
-
+    function igm_render_schedule_settings_form()
+    {
         if (isset($_POST['save_schedule']) && check_admin_referer('igm_save_settings', 'igm_settings_nonce')) {
             update_option('igm_delete_cron_interval', sanitize_text_field($_POST['igm_delete_cron_interval']));
             echo '<div class="updated"><p>Schedule settings saved.</p></div>';
 
+            wp_clear_scheduled_hook('igm_cron_update_course_names');
             wp_clear_scheduled_hook('igm_cron_delete_removed_courses');
             $delete_interval = get_option('igm_delete_cron_interval', '');
+            $update_interval = sanitize_text_field($_POST['igm_update_cron_interval']);
             if ($delete_interval !== 'disabled') {
                 wp_schedule_event(time(), $delete_interval, 'igm_cron_delete_removed_courses');
             }
-
+            if ($update_interval !== 'disabled') {
+                wp_schedule_event(time(), $update_interval, 'igm_cron_update_course_names');
+            }
         }
+        $update_interval = sanitize_text_field($_POST['igm_update_cron_interval']);
         $delete_interval = get_option('igm_delete_cron_interval', '');
-
-
-
         ?>
         <form method="post">
             <?php wp_nonce_field('igm_save_settings', 'igm_settings_nonce'); ?>
             <h2>Schedule Settings</h2>
             <table class="form-table">
                 <tr>
+                    <th>Update Interval</th>
+                    <td>
+                        <select name="igm_update_cron_interval">
+                            <?php foreach (igm_get_cron_options(true) as $val => $label): ?>
+                                <option value="<?php echo esc_attr($val); ?>"<?php selected($update_interval, $val); ?>><?php echo esc_html($label); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </td>
+                </tr>
+                <tr>
                     <th>Delete Interval</th>
                     <td>
                         <select name="igm_delete_cron_interval">
                             <?php foreach (igm_get_cron_options(true) as $val => $label): ?>
-                                <option value="<?php echo esc_attr($val); ?>" <?php selected($delete_interval, $val); ?>><?php echo esc_html($label); ?></option>
+                                <option value="<?php echo esc_attr($val); ?>"<?php selected($delete_interval, $val); ?>><?php echo esc_html($label); ?></option>
                             <?php endforeach; ?>
                         </select>
                     </td>
@@ -486,71 +566,66 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
             <?php submit_button('Save Schedule', 'primary', 'save_schedule'); ?>
         </form>
         <?php
-    }
-    // Helper to mask token, showing only last 4 characters
-    function mask_token($token) {
-        $len = strlen($token);
-        return $len > 4 ? str_repeat('*', $len - 4) . substr($token, -4) : $token;
-    }
-
-    function igm_render_teachable_circle_settings_form() {
-        $circle_v1 = get_option('igm_circle_api_token_v1', '');
-        $circle_v2 = get_option('igm_circle_api_token_v2', '');
-        $teachable_api = get_option('igm_teachable_api_key', '');
-
-        // Handle form submit
-        if (isset($_POST['save_api_tokens']) && check_admin_referer('igm_save_settings', 'igm_settings_nonce')) {
-            $new_circle_v1 = sanitize_text_field($_POST['igm_circle_api_v1']);
-            $new_circle_v2 = sanitize_text_field($_POST['igm_circle_api_v2']);
-            $new_teachable_api = sanitize_text_field($_POST['igm_teachable_api_token']);
-
-            // Update only if not still masked
-            if ($new_circle_v1 !== mask_token($circle_v1)) {
-                update_option('igm_circle_api_token_v1', $new_circle_v1);
-                $circle_v1 = $new_circle_v1;
-            }
-
-            if ($new_circle_v2 !== mask_token($circle_v2)) {
-                update_option('igm_circle_api_token_v2', $new_circle_v2);
-                $circle_v2 = $new_circle_v2;
-            }
-
-            if ($new_teachable_api !== mask_token($teachable_api)) {
-                update_option('igm_teachable_api_key', $new_teachable_api);
-                $teachable_api = $new_teachable_api;
-            }
-
-            echo '<div class="updated"><p>API tokens saved.</p></div>';
         }
-
+        // Helper to mask token, showing only last 4 characters
+        function mask_token($token)
+        {
+            $len = strlen($token);
+            return $len > 4 ? str_repeat('*', $len - 4) . substr($token, -4) : $token;
+        }
+        function igm_render_teachable_circle_settings_form()
+        {
+            $circle_v1     = get_option('igm_circle_api_token_v1', '');
+            $circle_v2     = get_option('igm_circle_api_token_v2', '');
+            $teachable_api = get_option('igm_teachable_api_key', '');
+            // Handle form submit
+            if (isset($_POST['save_api_tokens']) && check_admin_referer('igm_save_settings', 'igm_settings_nonce')) {
+                $new_circle_v1     = sanitize_text_field($_POST['igm_circle_api_v1']);
+                $new_circle_v2     = sanitize_text_field($_POST['igm_circle_api_v2']);
+                $new_teachable_api = sanitize_text_field($_POST['igm_teachable_api_token']);
+                // Update only if not still masked
+                if ($new_circle_v1 !== mask_token($circle_v1)) {
+                    update_option('igm_circle_api_token_v1', $new_circle_v1);
+                    $circle_v1 = $new_circle_v1;
+                }
+                if ($new_circle_v2 !== mask_token($circle_v2)) {
+                    update_option('igm_circle_api_token_v2', $new_circle_v2);
+                    $circle_v2 = $new_circle_v2;
+                }
+                if ($new_teachable_api !== mask_token($teachable_api)) {
+                    update_option('igm_teachable_api_key', $new_teachable_api);
+                    $teachable_api = $new_teachable_api;
+                }
+                echo '<div class="updated"><p>API tokens saved.</p></div>';
+            }
         ?>
         <form method="post">
             <?php wp_nonce_field('igm_save_settings', 'igm_settings_nonce'); ?>
-            <h2>API Keys *</h2>
+            <h2>API Keys</h2>
             <table class="form-table">
                 <tr>
-                    <th>Circle API V1 *</th>
+                    <th>Circle API V1</th>
                     <td>
-                        <input type="text" name="igm_circle_api_v1" 
-                            value="<?php echo esc_attr(mask_token($circle_v1)); ?>" 
+                        <input type="text" name="igm_circle_api_v1"
+                            value="<?php echo esc_attr(mask_token($circle_v1)); ?>"
                             class="regular-text"
                             onfocus="clearIfMasked(this)" />
                     </td>
                 </tr>
                 <tr>
-                    <th>Circle API V2 *</th>
+                    <th>Circle API V2</th>
                     <td>
-                        <input type="text" name="igm_circle_api_v2" 
-                            value="<?php echo esc_attr(mask_token($circle_v2)); ?>" 
+                        <input type="text" name="igm_circle_api_v2"
+                            value="<?php echo esc_attr(mask_token($circle_v2)); ?>"
                             class="regular-text"
                             onfocus="clearIfMasked(this)" />
                     </td>
                 </tr>
                 <tr>
-                    <th>Teachable API Token *</th>
+                    <th>Teachable API Token</th>
                     <td>
-                        <input type="text" name="igm_teachable_api_token" 
-                            value="<?php echo esc_attr(mask_token($teachable_api)); ?>" 
+                        <input type="text" name="igm_teachable_api_token"
+                            value="<?php echo esc_attr(mask_token($teachable_api)); ?>"
                             class="regular-text"
                             onfocus="clearIfMasked(this)" />
                     </td>
@@ -567,230 +642,189 @@ Description: Seamlessly manage the integration between Teachable and Circle to c
             }
         </script>
         <?php
-    }
-    function igm_render_community_settings_form() {
-
-        if (isset($_POST['save_community']) && check_admin_referer('igm_save_settings', 'igm_settings_nonce')) {
-            update_option('igm_circle_community_id', sanitize_text_field($_POST['igm_circle_community_id']));
-            echo '<div class="updated"><p>Community saved.</p></div>';
         }
-        $selected = get_option('igm_circle_community_id', '');
-        $communities = igm_fetch_circle_communities();
+        function igm_render_community_settings_form()
+        {
+            if (isset($_POST['save_community']) && check_admin_referer('igm_save_settings', 'igm_settings_nonce')) {
+                update_option('igm_circle_community_id', sanitize_text_field($_POST['igm_circle_community_id']));
+                echo '<div class="updated"><p>Community saved.</p></div>';
+            }
+
+            $selected    = get_option('igm_circle_community_id', '');
+            $communities = igm_fetch_circle_communities();
+            $token       = get_option('igm_circle_api_token_v1');
         ?>
-        <form method="post">
-            <?php wp_nonce_field('igm_save_settings', 'igm_settings_nonce'); ?>
-            <h2>Circle Community</h2>
-            <table class="form-table">
-                <tr>
-                    <th>Select Community</th>
-                    <td>
-                        <select name="igm_circle_community_id">
+    <form method="post">
+        <?php wp_nonce_field('igm_save_settings', 'igm_settings_nonce'); ?>
+        <h2>Circle Community</h2>
+        <table class="form-table">
+            <tr>
+                <th>Select Community</th>
+                <td>
+                    <select name="igm_circle_community_id">
+                        <?php if (is_array($communities) && !empty($communities)): ?>
                             <option value="">— Select a Community —</option>
                             <?php foreach ($communities as $id => $name): ?>
-                                <option value="<?php echo esc_attr($id); ?>" <?php selected($selected, $id); ?>><?php echo esc_html($name); ?></option>
+                                <option value="<?php echo esc_attr($id); ?>"<?php selected($selected, $id); ?>>
+                                    <?php echo esc_html($name); ?>
+                                </option>
                             <?php endforeach; ?>
-                        </select>
-                    </td>
-                </tr>
-            </table>
-            <?php submit_button('Save Community', 'primary', 'save_community'); ?>
-        </form>
-        <?php
+                        <?php else: ?>
+                            <option value="" disabled>⚠️ No communities found – check Circle API key and connection</option>
+                        <?php endif; ?>
+                    </select>
+                </td>
+            </tr>
+        </table>
+        <?php submit_button('Save Community', 'primary', 'save_community'); ?>
+    </form>
+    <?php
     }
-
-    function igm_fetch_circle_communities() {
+    function igm_fetch_circle_communities()
+    {
         $token = get_option('igm_circle_api_token_v1');
-        if (!$token) return [];
-
+        if (! $token) {
+            return []; // No token = don't show error
+        }
         $response = wp_remote_get('https://app.circle.so/api/v1/communities', [
             'headers' => ['Authorization' => 'Token ' . $token],
         ]);
-
-        if (is_wp_error($response)) return [];
-
-        $data = json_decode(wp_remote_retrieve_body($response), true);
-
-        if (!isset($data)) return [];
-
+        if (is_wp_error($response)) {
+            return false;
+        }
+        $body = wp_remote_retrieve_body($response);
+        $data = json_decode($body, true);
+        // Log and fail if response is unauthorized or not a list of communities
+        if (! is_array($data)) {
+            return [];
+        }
+        // If it's a flat array with 'status' => 'unauthorized', treat it as error
+        if (isset($data['status']) && $data['status'] === 'unauthorized') {
+            error_log('Circle API: Unauthorized - ' . ($data['message'] ?? 'No message'));
+            return [];
+        }
+        // Ensure it's an array of communities
         $communities = [];
         foreach ($data as $community) {
-            $communities[$community['id']] = $community['name'];
+            if (is_array($community) && isset($community['id'], $community['name'])) {
+                $communities[$community['id']] = $community['name'];
+            }
         }
-
         return $communities;
     }
-    function igm_render_space_group_settings_form() {
-    
 
-        if (isset($_POST['save_space_group']) && check_admin_referer('igm_save_settings', 'igm_settings_nonce')) {
-            update_option('igm_circle_space_group_id', sanitize_text_field($_POST['igm_circle_space_group_id']));
-            echo '<div class="updated"><p>Space group saved.</p></div>';
-        }
-         $selected = get_option('igm_circle_space_group_id', '');
-        $community_id = get_option('igm_circle_community_id');
-        $space_groups = igm_fetch_space_groups($community_id);
-        ?>
-        <form method="post">
-            <?php wp_nonce_field('igm_save_settings', 'igm_settings_nonce'); ?>
-            <h2>Circle Space Group</h2>
-            <table class="form-table">
-                <tr>
-                    <th>Select Space Group</th>
-                    <td>
-                        <select name="igm_circle_space_group_id">
-                            <option value="">— Select a Group —</option>
-                            <?php foreach ($space_groups as $id => $name): ?>
-                                <option value="<?php echo esc_attr($id); ?>" <?php selected($selected, $id); ?>><?php echo esc_html($name); ?></option>
-                            <?php endforeach; ?>
-                        </select>
-                    </td>
-                </tr>
-            </table>
-            <?php submit_button('Save Space Group', 'primary', 'save_space_group'); ?>
-        </form>
-        <?php
-    }
-
-    function igm_fetch_space_groups($community_id) {
-        $token = get_option('igm_circle_api_token_v1');
-        if (!$token || !$community_id) return [];
-        $response = wp_remote_get("https://app.circle.so/api/v1/space_groups?community_id={$community_id}", [
-            'headers' => ['Authorization' => 'Token ' . $token],
-        ]);
-
-        if (is_wp_error($response)) return [];
-
-        $data = json_decode(wp_remote_retrieve_body($response), true);
-
-
-        if (!isset($data)) return [];
-
-        $groups = [];
-        foreach ($data as $group) {
-            $groups[$group['id']] = $group['name'];
-        }
-
-        return $groups;
-    }
-
-    function igm_get_cron_options($include_disabled = false) {
-        $options = [
-            'every_minute' => 'Every Minute',
-            'hourly'     => 'Hourly',
-            'twicedaily' => 'Twice Daily',
-            'daily'      => 'Daily',
-        ];
-        if ($include_disabled) {
-            return ['disabled' => 'Disabled'] + $options;
-        }
-        return $options;
-    }
-
-    /**
-     * Mask API keys – keeps only last 4 characters.
-     */
-    function mask_api_key($key)
-    {
-        $len = strlen($key);
-        if ($len <= 4) {
-            return str_repeat('*', $len);
-        }
-        return str_repeat('*', $len - 4) . substr($key, -4);
-    }
-    if (! class_exists('WP_List_Table')) {
-        require_once ABSPATH . 'wp-admin/includes/class-wp-list-table.php';
-    }
-    class IGM_Logs_List_Table extends WP_List_Table
-    {
-        public function __construct()
+        function igm_get_cron_options($include_disabled = false)
         {
-            parent::__construct([
-                'singular' => 'Log',
-                'plural'   => 'Logs',
-                'ajax'     => false,
-            ]);
-        }
-        public function get_columns()
-        {
-            return [
-                'action'     => 'Action',
-                'message'    => 'Message',
-                'created_at' => 'Time',
+            $options = [
+                'every_minute' => 'Every Minute',
+                'hourly'       => 'Hourly',
+                'twicedaily'   => 'Twice Daily',
+                'daily'        => 'Daily',
             ];
+            if ($include_disabled) {
+                return ['disabled' => 'Disabled'] + $options;
+            }
+            return $options;
         }
-        public function get_sortable_columns()
+        function mask_api_key($key)
         {
-            return [
-                'created_at' => ['created_at', true],
-            ];
+            $len = strlen($key);
+            if ($len <= 4) {
+                return str_repeat('*', $len);
+            }
+            return str_repeat('*', $len - 4) . substr($key, -4);
         }
-        public function column_default($item, $column_name)
-        {
-            return esc_html($item[$column_name]);
+        if (! class_exists('WP_List_Table')) {
+            require_once ABSPATH . 'wp-admin/includes/class-wp-list-table.php';
         }
-        public function prepare_items()
+        class IGM_Logs_List_Table extends WP_List_Table
         {
-            global $wpdb;
-            $table = $wpdb->prefix . 'teachable_circle_logs';
-            // Set columns
-            $columns               = $this->get_columns();
+            public function __construct()
+            {
+                parent::__construct([
+                    'singular' => 'Log',
+                    'plural'   => 'Logs',
+                    'ajax'     => false,
+                ]);
+            }
+            public function get_columns()
+            {
+                return [
+                    'action'     => 'Action',
+                    'message'    => 'Message',
+                    'created_at' => 'Time',
+                ];
+            }
+            public function get_sortable_columns()
+            {
+                return [
+                    'created_at' => ['created_at', true],
+                ];
+            }
+            public function column_default($item, $column_name)
+            {
+                return esc_html($item[$column_name]);
+            }
+            public function prepare_items()
+            {
+                global $wpdb;
+                $table = $wpdb->prefix . 'teachable_circle_logs';
+                // Set columns
+                $columns               = $this->get_columns();
                 $hidden                = [];
                 $sortable              = $this->get_sortable_columns();
                 $this->_column_headers = [$columns, $hidden, $sortable];
-
                 // Pagination
                 $per_page     = $this->get_items_per_page('logs_per_page', 25);
                 $current_page = $this->get_pagenum();
                 $offset       = ($current_page - 1) * $per_page;
-
                 // Sorting
                 $orderby = isset($_GET['orderby']) && array_key_exists($_GET['orderby'], $sortable) ? $_GET['orderby'] : 'created_at';
-            $order   = isset($_GET['order']) && strtolower($_GET['order']) === 'asc' ? 'ASC' : 'DESC';
-            // Count total
-            $total_items = (int) $wpdb->get_var("SELECT COUNT(*) FROM $table");
-            // Fetch paginated results
-            $query       = $wpdb->prepare("SELECT * FROM $table ORDER BY $orderby $order LIMIT %d OFFSET %d", $per_page, $offset);
-            $this->items = $wpdb->get_results($query, ARRAY_A);
-            // Set pagination args
-            $this->set_pagination_args([
-                'total_items' => $total_items,
-                'per_page'    => $per_page,
-                'total_pages' => ceil($total_items / $per_page),
-            ]);
+                $order   = isset($_GET['order']) && strtolower($_GET['order']) === 'asc' ? 'ASC' : 'DESC';
+                // Count total
+                $total_items = (int) $wpdb->get_var("SELECT COUNT(*) FROM $table");
+                // Fetch paginated results
+                $query       = $wpdb->prepare("SELECT * FROM $table ORDER BY $orderby $order LIMIT %d OFFSET %d", $per_page, $offset);
+                $this->items = $wpdb->get_results($query, ARRAY_A);
+                // Set pagination args
+                $this->set_pagination_args([
+                    'total_items' => $total_items,
+                    'per_page'    => $per_page,
+                    'total_pages' => ceil($total_items / $per_page),
+                ]);
+            }
         }
-    }
-    function igm_render_logs_page()
-    {
-        echo '<div class="wrap"><h1 class="wp-heading-inline">Integration Logs</h1>';
-        $table = new IGM_Logs_List_Table();
-        $table->prepare_items();
-        echo '<form method="get">';
-        echo '<input type="hidden" name="page" value="teachable-circle-logs" />';
-        $table->display();
-        echo '</form>';
-        echo '</div>';
-    }
-    add_filter('set-screen-option', function ($status, $option, $value) {
+        function igm_render_logs_page()
+        {
+            echo '<div class="wrap"><h1 class="wp-heading-inline">Integration Logs</h1>';
+            $table = new IGM_Logs_List_Table();
+            $table->prepare_items();
+            echo '<form method="get">';
+            echo '<input type="hidden" name="page" value="teachable-circle-logs" />';
+            $table->display();
+            echo '</form>';
+            echo '</div>';
+        }
+        add_filter('set-screen-option', function ($status, $option, $value) {
             if ($option === 'logs_per_page') {
                 return (int) $value;
             }
-
             return $status;
-    }, 10, 3);
-    add_action('admin_menu', function () {
-        $hook = add_submenu_page(
-            'teachable-circle-mappings',
-            'Integration Logs',
-            'Logs',
-            'manage_options',
-            'teachable-circle-logs',
-            'igm_render_logs_page'
-        );
-        add_action("load-$hook", function () {
-            add_screen_option('per_page', [
-                'label'   => 'Number of items per page: ',
-                'default' => 25,
-                'option'  => 'logs_per_page',
-            ]);
+        }, 10, 3);
+        add_action('admin_menu', function () {
+            $hook = add_submenu_page(
+                'teachable-circle-mappings',
+                'Integration Logs',
+                'Logs',
+                'manage_options',
+                'teachable-circle-logs',
+                'igm_render_logs_page'
+            );
+            add_action("load-$hook", function () {
+                add_screen_option('per_page', [
+                    'label'   => 'Number of items per page: ',
+                    'default' => 25,
+                    'option'  => 'logs_per_page',
+                ]);
+            });
         });
-    });

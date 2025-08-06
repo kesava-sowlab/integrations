@@ -1,6 +1,6 @@
-# WordPress Circle–Teachable Integration Plugin
+# I Got Mind Circle–Teachable Integration Plugin
 
-This plugin integrates your WordPress site with **Circle** and **Teachable**. It enables webhook handling for new Teachable enrollments and allows you to manage Circle communities and space groups from your WordPress admin dashboard.
+This plugin integrates site with **Circle** and **Teachable**. It enables webhook handling for new Teachable enrollments and allows you to manage Circle communities and space groups from your WordPress admin dashboard.
 
 ---
 
